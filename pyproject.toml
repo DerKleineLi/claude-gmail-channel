@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-gmail-channel"
+version = "0.1.0"
+description = "Claude Code channel MCP that forwards Gmail push events into a running session, so the agent wakes up only when a real email arrives."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Haoxuan Li" }]
+keywords = ["claude", "claude-code", "mcp", "gmail", "channel", "push"]
+dependencies = [
+  "mcp>=1.0.0",
+]
+
+[project.scripts]
+claude-gmail-channel = "server:_cli"
+
+[tool.setuptools]
+py-modules = ["server"]
