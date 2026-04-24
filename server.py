@@ -29,6 +29,7 @@ import re
 import signal
 import subprocess
 import uuid
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -37,11 +38,27 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 import mcp.types as types
 
+# ---------------------------------------------------------------------------
+# Logging — stderr (captured by Claude Code MCP log) + rotating file so we
+# have persistent history across MCP restarts to diagnose session-capture /
+# watcher issues. stdout is the MCP transport; do not write to it.
+# ---------------------------------------------------------------------------
+LOG_DIR = Path.home() / ".claude" / "gmail_channel"
+LOG_FILE = LOG_DIR / "debug.log"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_fmt = logging.Formatter("%(asctime)s %(levelname)s gmail_channel: %(message)s")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s gmail_channel: %(message)s",
 )
 log = logging.getLogger("gmail_channel")
+
+_file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(_fmt)
+log.addHandler(_file_handler)
+log.setLevel(logging.DEBUG)
 
 PROJECT = os.environ.get("GMAIL_CHANNEL_PROJECT", "gws-claude-ca781a")
 LABELS = os.environ.get("GMAIL_CHANNEL_LABELS", "INBOX")
@@ -54,10 +71,64 @@ WATCH_RENEW_EVERY_SEC = int(os.environ.get("GMAIL_CHANNEL_WATCH_RENEW_SEC", str(
 RULES_FILE = Path.home() / ".claude" / "gmail_channel" / "rules.json"
 ARCHIVE_FILE = Path.home() / ".claude" / "gmail_channel" / "archive.ndjson"
 
-server: Server = Server("gmail")
 _session: Any = None
 _watcher_task: asyncio.Task | None = None
 _renewer_task: asyncio.Task | None = None
+
+
+def _ensure_watcher_tasks() -> None:
+    """Start the Gmail watcher + watch-renewer if they aren't already running.
+
+    Called from CapturingServer._handle_message on the first incoming client
+    message, and from list_tools / call_tool as a belt-and-suspenders fallback.
+    Each task is idempotently respawned if a prior instance died.
+    """
+    global _watcher_task, _renewer_task
+    if _renewer_task is None or _renewer_task.done():
+        _renewer_task = asyncio.create_task(_run_watch_renewer())
+        log.info("watch renewer task started")
+    if _watcher_task is None or _watcher_task.done():
+        _watcher_task = asyncio.create_task(_run_watcher())
+        _stats["started_at"] = asyncio.get_event_loop().time()
+        log.info("watcher task started")
+
+
+class CapturingServer(Server):
+    """Capture the session ref on the first incoming client message.
+
+    Why: `_session` used to be bound only inside `list_tools` / `call_tool`,
+    which depended on Claude Code listing tools or invoking one before any
+    email arrived. If the client ever didn't list tools on connect, the
+    watcher/renewer wouldn't start and inbound emails would be silently
+    dropped ("no session captured yet; dropping event"). The MCP lowlevel
+    `_handle_message` hook runs for every client message — including the
+    very first `initialize` request — so binding here guarantees the
+    watcher + session ref are live before any Gmail event can arrive.
+    """
+
+    async def _handle_message(self, message, session, lifespan_context,
+                              raise_exceptions: bool = False):
+        global _session
+        if _session is None:
+            _session = session
+            # Unwrap to the innermost message type so the log is specific
+            # (e.g. `InitializedNotification`) instead of the outer envelope.
+            if hasattr(message, "request"):           # RequestResponder
+                inner = getattr(message.request, "root", message.request)
+            elif hasattr(message, "root"):            # ClientNotification
+                inner = message.root
+            else:
+                inner = message
+            log.info("captured session ref (on first incoming message: %s)",
+                     type(inner).__name__)
+            _ensure_watcher_tasks()
+        else:
+            log.debug("_handle_message: session already captured")
+        await super()._handle_message(message, session, lifespan_context,
+                                       raise_exceptions)
+
+
+server: Server = CapturingServer("gmail")
 _stats = {
     "started_at": None,
     "events": 0,
@@ -260,6 +331,7 @@ async def _push(msg: dict[str, Any]) -> None:
     if _session is None:
         log.warning("no session captured yet; dropping event for msgId=%s", msg.get("id"))
         return
+    log.debug("_push: session=%s msgId=%s", id(_session), msg.get("id"))
     ctx = _build_context(msg)
     rule = _resolve_rule(ctx)
 
@@ -414,20 +486,20 @@ async def _run_watcher() -> None:
 
 
 def _capture_session() -> None:
-    global _session, _watcher_task, _renewer_task
+    """Fallback session-capture + watcher-start path.
+
+    Primary capture happens in `CapturingServer._handle_message` on the first
+    incoming message. This request-context path is kept as a belt-and-suspenders
+    fallback inside the tool handlers in case the subclass hook ever misses.
+    """
+    global _session
     if _session is None:
         try:
             _session = server.request_context.session
-            log.info("captured session ref")
+            log.info("captured session ref (fallback via request_context)")
         except Exception as e:
             log.warning("could not capture session: %s", e)
-    if _renewer_task is None or _renewer_task.done():
-        _renewer_task = asyncio.create_task(_run_watch_renewer())
-        log.info("watch renewer task started")
-    if _watcher_task is None or _watcher_task.done():
-        _watcher_task = asyncio.create_task(_run_watcher())
-        _stats["started_at"] = asyncio.get_event_loop().time()
-        log.info("watcher task started")
+    _ensure_watcher_tasks()
 
 
 # ---------------------------------------------------------------------------
