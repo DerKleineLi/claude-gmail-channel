@@ -137,7 +137,12 @@ _stats = {
     "watch_last_registered_at": None,
     "watch_last_expiration": None,
     "watch_renewals": 0,
+    "alerts": 0,
 }
+
+# True after we've fired a token-expired alert in the current failure streak.
+# Cleared on successful watch registration so a future expiry will re-fire.
+_token_expired_alerted = False
 
 
 def _derive_topic() -> str:
@@ -186,6 +191,10 @@ async def _register_gmail_watch() -> bool:
     _stats["watch_last_registered_at"] = asyncio.get_event_loop().time()
     _stats["watch_renewals"] += 1
     log.info("gmail watch registered; expiration=%s", _stats["watch_last_expiration"])
+    # Watch registered cleanly — clear the token-expired one-shot so a future
+    # expiry will alert again.
+    global _token_expired_alerted
+    _token_expired_alerted = False
     return True
 
 
@@ -327,6 +336,66 @@ def _append_archive(ctx: dict[str, str], rule_name: str) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+_TOKEN_EXPIRY_PATTERNS = (
+    "invalid_grant",
+    "Token has been expired or revoked",
+    "Failed to get Gmail token",
+)
+
+
+async def _alert_token_expired(stderr_excerpt: str) -> None:
+    """Push a synthetic channel event when the OAuth token is expired/revoked.
+
+    Surfaces in Claude Code as a normal gmail channel notification — Claude can
+    then ping the user on Telegram and walk through the re-auth steps.
+    """
+    if _session is None:
+        log.warning("token-expired but no session captured; skipping alert")
+        return
+    prompt = (
+        "🛑 **Gmail OAuth token is expired or revoked.** New mail won't fire "
+        "channel events until this is repaired. Per the user's standing "
+        "instruction, recover automatically — do NOT wait for confirmation, "
+        "do NOT ask, just execute the steps and report the outcome on "
+        "Telegram afterwards.\n\n"
+        "Recovery sequence (execute in order):\n"
+        "  1. Launch `gws auth login --full` in the background and capture the "
+        "consent URL it prints.\n"
+        "  2. Drive the consent flow via the Chrome DevTools MCP: open the URL, "
+        "click the Fall-From-Grace account, click through the unverified-app "
+        "warning if present, click Continue on the basic-info screen, tick "
+        "'Select all' on the scopes page, click Continue. The localhost "
+        "listener `gws auth login` opened will capture the redirect.\n"
+        "  3. `rm -f ~/.config/gws/token_cache.json` to drop any stale access "
+        "token (the saved refresh token is still good).\n"
+        "  4. Call the gmail MCP `restart_watcher` tool.\n"
+        "  5. Verify with `gws auth status | tail -3` (look for "
+        "`token_valid: true`) and `tail /home/hli/.claude/gmail_channel/debug.log` "
+        "(look for `gmail watch registered`).\n"
+        "  6. Telegram-ping the user via the standard chat with: status of "
+        "the recovery, whether watcher is alive, and any blocker. If the "
+        "Chrome OAuth consent screen rendered blank, hard-reload that tab "
+        "once before retrying — Google occasionally serves a blank consent "
+        "page on first load.\n\n"
+        "Watcher stderr that triggered this alert:\n"
+        f"```\n{stderr_excerpt[:600]}\n```"
+    )
+    try:
+        raw = types.JSONRPCNotification(
+            jsonrpc="2.0",
+            method="notifications/claude/channel",
+            params={
+                "content": prompt,
+                "meta": {"source": "gmail", "alert": "token_expired"},
+            },
+        )
+        await _session.send_message(SessionMessage(message=types.JSONRPCMessage(root=raw)))
+        _stats["alerts"] = _stats.get("alerts", 0) + 1
+        log.info("pushed token-expired alert to session")
+    except Exception as e:
+        log.exception("failed to push token-expired alert: %s", e)
+
+
 async def _push(msg: dict[str, Any]) -> None:
     if _session is None:
         log.warning("no session captured yet; dropping event for msgId=%s", msg.get("id"))
@@ -389,18 +458,41 @@ def _set_pdeathsig() -> None:
 
 
 def _kill_orphan_watchers() -> None:
-    """Kill any pre-existing `gws gmail +watch` processes bound to the same
-    subscription — they're orphans from a previous MCP instance that would
-    otherwise compete for the same Pub/Sub messages and silently swallow them.
+    """Kill any pre-existing `gws gmail +watch` processes AND orphan
+    server.py instances bound to the same subscription. They'd otherwise
+    compete for the same Pub/Sub messages and silently swallow them — and
+    if only the watchers are killed, the orphan server respawns its own.
     """
-    pat = "gws gmail +watch"
+    pats = ["gws gmail +watch"]
     if SUBSCRIPTION:
-        pat = SUBSCRIPTION  # more precise; pkill -f matches full cmdline
-    try:
-        subprocess.run(["pkill", "-f", pat], check=False, timeout=5)
-        log.info("pkill -f %r (orphan cleanup)", pat)
-    except Exception as e:
-        log.warning("pkill failed (non-fatal): %s", e)
+        pats.append(SUBSCRIPTION)  # precise — pkill -f matches full cmdline
+    pats.append("gmail_channel/server.py")  # also kill orphan servers
+
+    my_pid = os.getpid()
+    for pat in pats:
+        # `pkill -f -P 0 --ns <pid>` is over-restrictive; we just exclude self
+        # via -P (parent excludes group leader) and pgrep+kill manually.
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-f", pat], timeout=5,
+            ).decode().split()
+        except subprocess.CalledProcessError:
+            continue  # nothing matching
+        except Exception as e:
+            log.warning("pgrep %r failed (non-fatal): %s", pat, e)
+            continue
+        for pid_str in out:
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+            if pid == my_pid:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                log.info("orphan-cleanup: SIGTERM pid=%s match=%r", pid, pat)
+            except (ProcessLookupError, PermissionError):
+                pass
 
 
 async def _kill_proc(proc: asyncio.subprocess.Process) -> None:
@@ -450,9 +542,18 @@ async def _run_watcher() -> None:
 
         async def drain_stderr() -> None:
             assert proc.stderr
+            global _token_expired_alerted
             try:
                 async for line in proc.stderr:
-                    log.info("watcher stderr: %s", line.decode(errors="replace").rstrip())
+                    text = line.decode(errors="replace").rstrip()
+                    log.info("watcher stderr: %s", text)
+                    # On the first token-expired indicator in this failure
+                    # streak, push an alert so Claude (and through Claude, the
+                    # user) sees it.  Re-armed when watch registers cleanly.
+                    if (not _token_expired_alerted
+                            and any(p in text for p in _TOKEN_EXPIRY_PATTERNS)):
+                        _token_expired_alerted = True
+                        asyncio.create_task(_alert_token_expired(text))
             except asyncio.CancelledError:
                 pass
 
