@@ -336,6 +336,37 @@ def _append_archive(ctx: dict[str, str], rule_name: str) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+async def _gmail_archive_and_mark_read(msg_id: str) -> None:
+    """Remove INBOX + UNREAD labels via gws.
+
+    Per the user's principle: every email processed by the gmail plugin
+    (whether channel-fired or silently archived) should be marked read.
+    UNREAD = "Claude didn't process it." Wrapped in try/except — an API
+    failure here must not break the NDJSON archive write that already
+    happened.
+    """
+    if not msg_id:
+        return
+    params = json.dumps({"userId": "me", "id": msg_id})
+    body = json.dumps({"removeLabelIds": ["UNREAD", "INBOX"]})
+    cmd = ["gws", "gmail", "users", "messages", "modify", "--params", params, "--json", body]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PATH": os.environ.get("PATH", "") + ":/usr/bin:/usr/local/bin"},
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            log.warning(
+                "archive mark-read failed msgId=%s rc=%s stderr=%s",
+                msg_id, proc.returncode, stderr.decode(errors="replace").strip()[:300],
+            )
+    except Exception as e:
+        log.warning("archive mark-read raised for msgId=%s: %s", msg_id, e)
+
+
 _TOKEN_EXPIRY_PATTERNS = (
     "invalid_grant",
     "Token has been expired or revoked",
@@ -413,6 +444,9 @@ async def _push(msg: dict[str, Any]) -> None:
         except Exception as e:
             log.exception("failed to archive: %s", e)
             _stats["last_error"] = f"archive failed: {e}"
+        # Mark read + remove from INBOX in Gmail (separate from NDJSON write
+        # so an API failure doesn't lose the local archive entry).
+        await _gmail_archive_and_mark_read(ctx["msg_id"])
         return
 
     # Normal path: render prompt and forward as channel notification.
